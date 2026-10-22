@@ -1,292 +1,214 @@
 import express, { Request, Response } from "express";
 import cors from "cors";
-import fs from "node:fs";
-import path from "node:path";
-import { exec } from "node:child_process";
-import { TelegramClient, Api } from "telegram";
+import { Api } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
+import { CONFIG } from "./config.js";
+import { parseTelegramLink } from "./utils/linkParser.js";
+import { openFolderPicker, openInExplorer } from "./utils/system.js";
+import {
+  getClient,
+  loadSavedSession,
+  saveSessionToDisk,
+  deleteSavedSession,
+  setPendingAuth,
+  getPendingAuth,
+} from "./services/telegramClient.js";
+import { getMessageMetadata, resolveChannelEntity } from "./services/metadataService.js";
+import { queueManager } from "./services/downloadQueue.js";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-let sessionString = "";
-let client: TelegramClient | null = null;
-let currentPhone = "";
-let phoneCodeHash = "";
+// Check current authorization status on startup
+app.get("/api/auth/status", async (_req: Request, res: Response): Promise<any> => {
+  try {
+    const hasSaved = Boolean(loadSavedSession());
+    if (!hasSaved) return res.json({ authorized: false });
 
-// Global live download progress tracker
-let downloadProgress = {
-  active: false,
-  percentage: 0,
-  downloadedBytes: 0,
-  totalBytes: 0,
-  speed: "0 MB/s",
-  fileName: "",
-  status: "idle",
-};
-
-// Robust link parser supporting direct channel messages and topic links
-function parseLink(link: string): { channelId: string; messageId: number } | null {
-  const cleanLink = link.trim();
-
-  // Format: https://t.me/c/2869794586/693 or https://t.me/c/2869794586/693/1234
-  const privateParts = cleanLink.match(/t\.me\/c\/(\d+)(?:\/\d+)*\/(\d+)/);
-  if (privateParts) {
-    return {
-      channelId: `-100${privateParts[1]}`,
-      messageId: parseInt(privateParts[2], 10),
-    };
+    const client = await getClient();
+    const isAuth = await client.isUserAuthorized();
+    return res.json({ authorized: isAuth });
+  } catch {
+    return res.json({ authorized: false });
   }
+});
 
-  // Format: https://t.me/channel_name/123
-  const publicParts = cleanLink.match(/t\.me\/([^/]+)(?:\/\d+)*\/(\d+)/);
-  if (publicParts) {
-    return {
-      channelId: publicParts[1],
-      messageId: parseInt(publicParts[2], 10),
-    };
-  }
-
-  return null;
-}
-
-// 1. Send Login Code
+// Step 1: Send Telegram Code
 app.post("/api/auth/send-code", async (req: Request, res: Response): Promise<any> => {
   try {
     const { apiId, apiHash, phone } = req.body;
-    if (!apiId || !apiHash || !phone) {
-      return res.status(400).json({ error: "apiId, apiHash, and phone are required" });
-    }
-
-    currentPhone = String(phone).trim();
-    const stringSession = new StringSession(sessionString);
-    client = new TelegramClient(stringSession, Number(apiId), String(apiHash), {
-      connectionRetries: 5,
-    });
-
-    await client.connect();
+    const client = await getClient(Number(apiId), String(apiHash));
 
     if (await client.isUserAuthorized()) {
-      return res.json({ status: "AUTHORIZED", message: "User already logged in" });
+      return res.json({ status: "AUTHORIZED" });
     }
 
+    const cleanPhone = String(phone).trim();
     const result = await client.sendCode(
-      {
-        apiId: Number(apiId),
-        apiHash: String(apiHash),
-      },
-      currentPhone
+      { apiId: Number(apiId), apiHash: String(apiHash) },
+      cleanPhone
     );
 
-    phoneCodeHash = result.phoneCodeHash;
-    return res.json({ status: "CODE_SENT", message: "Verification code sent to Telegram" });
+    setPendingAuth(cleanPhone, result.phoneCodeHash);
+    return res.json({ status: "CODE_SENT" });
   } catch (err: any) {
     return res.status(500).json({ error: err?.message || "Failed to send code" });
   }
 });
 
-// 2. Verify Code
+// Step 2: Verify Code
 app.post("/api/auth/verify-code", async (req: Request, res: Response): Promise<any> => {
   try {
     const { code } = req.body;
-    if (!client) return res.status(400).json({ error: "Initialize authentication first" });
+    const client = await getClient();
+    const { phone, hash } = getPendingAuth();
 
     await client.invoke(
       new Api.auth.SignIn({
-        phoneNumber: currentPhone,
-        phoneCodeHash: phoneCodeHash,
+        phoneNumber: phone,
+        phoneCodeHash: hash,
         phoneCode: String(code).trim(),
       })
     );
 
-    sessionString = (client.session as StringSession).save();
-    return res.json({ status: "SUCCESS", message: "Successfully logged in!" });
+    const sessionStr = (client.session as StringSession).save();
+    saveSessionToDisk(sessionStr);
+    return res.json({ status: "SUCCESS" });
   } catch (err: any) {
     if (err?.errorMessage === "SESSION_PASSWORD_NEEDED") {
-      return res.json({ status: "2FA_REQUIRED", message: "2-Step verification required" });
+      return res.json({ status: "2FA_REQUIRED" });
     }
-    return res.status(400).json({ error: err?.message || "Invalid verification code" });
+    return res.status(400).json({ error: err?.message || "Verification failed" });
   }
 });
 
-// 3. Verify 2FA
+// Step 3: Verify 2FA
 app.post("/api/auth/verify-password", async (req: Request, res: Response): Promise<any> => {
   try {
     const { password } = req.body;
-    if (!client) return res.status(400).json({ error: "Client not connected" });
+    const client = await getClient();
+    await (client as any).signInWithPassword({ password: String(password) });
 
-    await (client as any).signInWithPassword({
-      password: String(password),
-    });
-
-    sessionString = (client.session as StringSession).save();
-    return res.json({ status: "SUCCESS", message: "2FA verification successful!" });
+    const sessionStr = (client.session as StringSession).save();
+    saveSessionToDisk(sessionStr);
+    return res.json({ status: "SUCCESS" });
   } catch (err: any) {
     return res.status(400).json({ error: err?.message || "Invalid 2FA password" });
   }
 });
 
-// 4. Windows Native Folder Picker
-app.get("/api/browse-folder", (_req: Request, res: Response): any => {
-  const cmd = `powershell -NoProfile -Command "Add-Type -AssemblyName System.windows.forms; $f = New-Object System.Windows.Forms.FolderBrowserDialog; $f.Description = 'Select Media Save Directory'; if($f.ShowDialog() -eq 'OK'){ Write-Output $f.SelectedPath }"`;
-
-  exec(cmd, (error, stdout) => {
-    if (error) {
-      return res.status(500).json({ error: "Failed to open folder browser" });
-    }
-    const selected = stdout.trim();
-    return res.json({ selectedFolder: selected || null });
-  });
+// Logout: Wipes saved session from disk
+app.post("/api/auth/logout", async (_req: Request, res: Response): Promise<any> => {
+  deleteSavedSession();
+  return res.json({ status: "LOGGED_OUT" });
 });
 
-// 5. Download Progress Endpoint
-app.get("/api/download-progress", (_req: Request, res: Response): any => {
-  return res.json(downloadProgress);
+// Native folder browse dialog
+app.get("/api/system/browse-folder", async (_req: Request, res: Response): Promise<any> => {
+  const selected = await openFolderPicker();
+  return res.json({ selectedFolder: selected });
 });
 
-// 6. Direct Stream Downloader with Resilient Media Detection
-app.post("/api/download", async (req: Request, res: Response): Promise<any> => {
+// Open folder in Windows File Explorer
+app.post("/api/system/open-explorer", (req: Request, res: Response): any => {
+  const { folderPath } = req.body;
+  if (folderPath) openInExplorer(folderPath);
+  return res.json({ status: "OK" });
+});
+
+// Preview metadata before download
+app.post("/api/media/preview", async (req: Request, res: Response): Promise<any> => {
   try {
-    const { link, saveFolder } = req.body;
-    if (!client || !(await client.isUserAuthorized())) {
-      return res.status(401).json({ error: "Session unauthorized. Please log in first." });
-    }
+    const { link } = req.body;
+    const parsed = parseTelegramLink(link);
+    if (!parsed) return res.status(400).json({ error: "Invalid Telegram link format." });
 
-    const parsed = parseLink(link);
-    if (!parsed) {
-      return res.status(400).json({ error: "Invalid Telegram link format." });
-    }
-
-    const targetDir = path.resolve(saveFolder);
-    if (!fs.existsSync(targetDir)) {
-      fs.mkdirSync(targetDir, { recursive: true });
-    }
-
-    // Step A: Resolve Entity
-    let entity: any = null;
-    try {
-      entity = await client.getEntity(parsed.channelId);
-    } catch {
-      const dialogs = await client.getDialogs({});
-      const match = dialogs.find((d) => {
-        const idStr = String(d.id);
-        return idStr === parsed.channelId || idStr.includes(parsed.channelId.replace("-100", ""));
-      });
-      if (match) {
-        entity = match.entity;
-      } else {
-        return res.status(404).json({
-          error: "Could not access this channel. Ensure your Telegram account is joined to this group/channel.",
-        });
-      }
-    }
-
-    // Step B: Fetch Target Message and Check for Media
-    let messages = await client.getMessages(entity, { ids: [parsed.messageId] });
-    let targetMsg = messages && messages.length > 0 ? messages[0] : null;
-
-    // Fallback: If link was a topic URL or reply thread anchor without media,
-    // search nearby message IDs (+/- 5) for the media message
-    if (!targetMsg || !targetMsg.media) {
-      console.log(`Message ${parsed.messageId} has no direct media. Checking nearby messages...`);
-      const searchRange = [parsed.messageId, parsed.messageId - 1, parsed.messageId + 1, parsed.messageId - 2, parsed.messageId + 2];
-      const surrounding = await client.getMessages(entity, { ids: searchRange });
-      const foundWithMedia = surrounding.find((m) => m && m.media);
-      if (foundWithMedia) {
-        targetMsg = foundWithMedia;
-      }
-    }
-
-    if (!targetMsg || !targetMsg.media) {
-      return res.status(400).json({
-        error: `No downloadable media found in message ${parsed.messageId}. If this is inside a topic, right click the exact video -> 'Copy Message Link'.`,
-      });
-    }
-
-    // Step C: Determine Filename & Total Size
-    let fileName = `Video_Lecture_${targetMsg.id}.mp4`;
-    let totalSize = 0;
-
-    if ("document" in targetMsg.media && (targetMsg.media as any).document) {
-      const doc = (targetMsg.media as any).document;
-      totalSize = Number(doc.size) || 0;
-      const attributes = doc.attributes || [];
-      const fileAttr = attributes.find((attr: any) => attr.fileName);
-      if (fileAttr && fileAttr.fileName) {
-        fileName = fileAttr.fileName;
-      }
-    } else if ("photo" in targetMsg.media) {
-      fileName = `Photo_${targetMsg.id}.jpg`;
-    }
-
-    const filePath = path.join(targetDir, fileName);
-    const writeStream = fs.createWriteStream(filePath);
-
-    // Initialize live progress tracker
-    downloadProgress = {
-      active: true,
-      percentage: 0,
-      downloadedBytes: 0,
-      totalBytes: totalSize,
-      speed: "0 MB/s",
-      fileName: fileName,
-      status: "Downloading...",
-    };
-
-    let lastTime = Date.now();
-    let lastBytes = 0;
-
-    // Step D: Stream download in chunks to avoid Node.js RAM limits
-    for await (const chunk of client.iterDownload({
-      file: targetMsg.media,
-      requestSize: 1024 * 512, // 512 KB chunks for smooth high-speed streaming
-    })) {
-      writeStream.write(chunk);
-      downloadProgress.downloadedBytes += chunk.length;
-
-      const now = Date.now();
-      const timeDiff = (now - lastTime) / 1000;
-      if (timeDiff >= 1) {
-        const bytesDiff = downloadProgress.downloadedBytes - lastBytes;
-        downloadProgress.speed = `${(bytesDiff / (1024 * 1024 * timeDiff)).toFixed(2)} MB/s`;
-        lastBytes = downloadProgress.downloadedBytes;
-        lastTime = now;
-      }
-
-      if (totalSize > 0) {
-        downloadProgress.percentage = Math.min(
-          100,
-          Math.round((downloadProgress.downloadedBytes / totalSize) * 100)
-        );
-      }
-    }
-
-    await new Promise((resolve) => writeStream.end(resolve));
-
-    downloadProgress = {
-      active: false,
-      percentage: 100,
-      downloadedBytes: totalSize,
-      totalBytes: totalSize,
-      speed: "0 MB/s",
-      fileName: fileName,
-      status: "Completed",
-    };
-
-    return res.json({
-      status: "SUCCESS",
-      filePath: filePath,
-      message: `Downloaded successfully to ${filePath}`,
-    });
+    const client = await getClient();
+    const preview = await getMessageMetadata(client, parsed.channelId, parsed.messageId);
+    return res.json(preview);
   } catch (err: any) {
-    downloadProgress.active = false;
-    downloadProgress.status = "Failed";
-    return res.status(500).json({ error: err?.message || "Download failed" });
+    return res.status(500).json({ error: err?.message || "Failed to fetch metadata" });
   }
 });
 
-const PORT = 5000;
-app.listen(PORT, () => {
-  console.log(`Node/TypeScript API running on http://localhost:${PORT}`);
+// Fetch last 30 video messages from a channel (Channel Video Browser)
+app.post("/api/media/channel-videos", async (req: Request, res: Response): Promise<any> => {
+  try {
+    const { link } = req.body;
+    const parsed = parseTelegramLink(link);
+    if (!parsed) return res.status(400).json({ error: "Invalid link format." });
+
+    const client = await getClient();
+    const entity = await resolveChannelEntity(client, parsed.channelId);
+    const messages = await client.getMessages(entity, { limit: 30 });
+
+    const videoList = messages
+      .filter((m) => m.media && "document" in m.media)
+      .map((m) => {
+        const doc = (m.media as any).document;
+        const attr = doc.attributes?.find((a: any) => a.fileName);
+        return {
+          id: m.id,
+          fileName: attr?.fileName || `Lecture_${m.id}.mp4`,
+          size: doc.size,
+          caption: m.message?.slice(0, 80) || "",
+        };
+      });
+
+    return res.json({ videos: videoList });
+  } catch (err: any) {
+    return res.status(500).json({ error: err?.message || "Failed to inspect channel" });
+  }
+});
+
+// Enqueue Single or Batch Downloads (Supports Range: startId -> endId)
+app.post("/api/download/enqueue", async (req: Request, res: Response): Promise<any> => {
+  try {
+    const { link, saveFolder, endMessageId } = req.body;
+    const parsed = parseTelegramLink(link);
+    if (!parsed) return res.status(400).json({ error: "Invalid link format." });
+
+    const client = await getClient();
+    const startId = parsed.messageId;
+    const endId = endMessageId ? Number(endMessageId) : startId;
+
+    const addedItems = [];
+    for (let id = startId; id <= endId; id++) {
+      const meta = await getMessageMetadata(client, parsed.channelId, id);
+      if (meta.hasMedia) {
+        const item = queueManager.addToQueue({
+          id: `${parsed.channelId}_${id}`,
+          channelId: parsed.channelId,
+          messageId: id,
+          channelTitle: meta.channelTitle,
+          fileName: meta.fileName,
+          targetFolder: saveFolder,
+          totalBytes: meta.fileSize,
+        });
+        addedItems.push(item);
+      }
+    }
+
+    // Begin background processing loop
+    queueManager.startProcessing(client);
+    return res.json({ status: "ENQUEUED", count: addedItems.length, items: addedItems });
+  } catch (err: any) {
+    return res.status(500).json({ error: err?.message || "Failed to enqueue items" });
+  }
+});
+
+// Polling live progress
+app.get("/api/download/queue-status", (_req: Request, res: Response): any => {
+  return res.json(queueManager.getQueue());
+});
+
+// Pause current active download
+app.post("/api/download/pause", (_req: Request, res: Response): any => {
+  queueManager.pauseCurrent();
+  return res.json({ status: "PAUSED" });
+});
+
+app.listen(CONFIG.PORT, () => {
+  console.log(`Telegram Modular Service listening on http://localhost:${CONFIG.PORT}`);
 });
