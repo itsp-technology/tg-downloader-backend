@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import { AuthCard } from "./components/AuthCard.js";
 import { MediaTable } from "./components/MediaTable.js";
 import { ProgressBar } from "./components/ProgressBar.js";
@@ -39,7 +39,6 @@ export default function App(): React.JSX.Element {
 
     requestWakeLock();
 
-    // Re-acquire wake lock if tab is switched back to
     const handleVisibilityChange = () => {
       if (document.visibilityState === "visible") {
         requestWakeLock();
@@ -74,6 +73,15 @@ export default function App(): React.JSX.Element {
     return () => clearInterval(interval);
   }, []);
 
+  // Total selected size formatted in GB
+  const selectedSizeGB = useMemo(() => {
+    const selectedSet = new Set(selectedIds);
+    const totalBytes = mediaItems
+      .filter((item) => selectedSet.has(item.id))
+      .reduce((sum, item) => sum + (item.fileSize || 0), 0);
+    return (totalBytes / (1024 * 1024 * 1024)).toFixed(2);
+  }, [mediaItems, selectedIds]);
+
   const handleBrowseFolder = async () => {
     const res = await fetch(`${API_BASE}/api/system/browse-folder`);
     const data = await res.json();
@@ -100,9 +108,17 @@ export default function App(): React.JSX.Element {
       setChannelId(data.channelId);
       setChannelTitle(data.channelTitle);
 
-      // Default: Tick all items
+      // Default: Select all items
       setSelectedIds(data.items.map((i: ChannelMediaItem) => i.id));
-      setStatusMsg({ text: `Found ${data.items.length} media files in "${data.channelTitle}"` });
+      
+      const totalGB = (
+        data.items.reduce((sum: number, i: ChannelMediaItem) => sum + (i.fileSize || 0), 0) /
+        (1024 * 1024 * 1024)
+      ).toFixed(2);
+
+      setStatusMsg({
+        text: `Found ${data.items.length} media files in "${data.channelTitle}" (${totalGB} GB total)`,
+      });
     } catch (e: any) {
       setStatusMsg({ text: e.message || "Failed to scan channel", error: true });
     } finally {
@@ -126,7 +142,7 @@ export default function App(): React.JSX.Element {
     }
 
     try {
-      setStatusMsg({ text: `Enqueuing ${selectedIds.length} files...` });
+      setStatusMsg({ text: `Enqueuing ${selectedIds.length} files (${selectedSizeGB} GB)...` });
       const res = await fetch(`${API_BASE}/api/download/enqueue-selected`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -138,7 +154,7 @@ export default function App(): React.JSX.Element {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
-      setStatusMsg({ text: `Successfully queued ${data.count} items for download!` });
+      setStatusMsg({ text: `Successfully queued ${data.count} items (${selectedSizeGB} GB) for download!` });
     } catch (e: any) {
       setStatusMsg({ text: e.message, error: true });
     }
@@ -261,7 +277,7 @@ export default function App(): React.JSX.Element {
                   marginTop: 14,
                 }}
               >
-                ⬇️ Download {selectedIds.length} Selected File(s)
+                ⬇️ Download {selectedIds.length} Selected File(s) ({selectedSizeGB} GB)
               </button>
             </>
           )}

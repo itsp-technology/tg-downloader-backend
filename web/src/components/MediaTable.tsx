@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useMemo } from "react";
 import { ChannelMediaItem } from "../types.js";
 
 interface Props {
@@ -18,10 +18,28 @@ export const MediaTable: React.FC<Props> = ({
 }) => {
   const [filterType, setFilterType] = useState<string>("all");
 
-  const filteredItems = items.filter((item) => {
-    if (filterType === "all") return true;
-    return item.fileType === filterType;
-  });
+  const filteredItems = useMemo(() => {
+    if (filterType === "all") return items;
+    return items.filter((item) => item.fileType === filterType);
+  }, [items, filterType]);
+
+  // Total byte calculations
+  const totalAllBytes = useMemo(() => {
+    return items.reduce((acc, item) => acc + (item.fileSize || 0), 0);
+  }, [items]);
+
+  const totalSelectedBytes = useMemo(() => {
+    const selectedSet = new Set(selectedIds);
+    return items
+      .filter((item) => selectedSet.has(item.id))
+      .reduce((acc, item) => acc + (item.fileSize || 0), 0);
+  }, [items, selectedIds]);
+
+  // Convert raw bytes to GB formatted string
+  const toGB = (bytes: number): string => {
+    const gb = bytes / (1024 * 1024 * 1024);
+    return gb.toFixed(2);
+  };
 
   const allFilteredSelected =
     filteredItems.length > 0 &&
@@ -60,6 +78,44 @@ export const MediaTable: React.FC<Props> = ({
 
   return (
     <div style={{ marginTop: 16 }}>
+      {/* Total Data Summary Card */}
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "1fr 1fr",
+          gap: 12,
+          padding: 12,
+          backgroundColor: "#f8fafc",
+          border: "1px solid #e2e8f0",
+          borderRadius: 6,
+          marginBottom: 12,
+        }}
+      >
+        <div style={{ textAlign: "center", borderRight: "1px solid #cbd5e1" }}>
+          <div style={{ fontSize: "0.75rem", color: "#64748b", textTransform: "uppercase", fontWeight: 700 }}>
+            Total Channel Media Size
+          </div>
+          <div style={{ fontSize: "1.25rem", fontWeight: 700, color: "#0f172a", marginTop: 2 }}>
+            {toGB(totalAllBytes)} <span style={{ fontSize: "0.9rem", fontWeight: 500 }}>GB</span>
+          </div>
+          <div style={{ fontSize: "0.75rem", color: "#64748b" }}>
+            Across all {items.length} files
+          </div>
+        </div>
+
+        <div style={{ textAlign: "center" }}>
+          <div style={{ fontSize: "0.75rem", color: "#0369a1", textTransform: "uppercase", fontWeight: 700 }}>
+            Selected to Download Size
+          </div>
+          <div style={{ fontSize: "1.25rem", fontWeight: 700, color: "#0284c7", marginTop: 2 }}>
+            {toGB(totalSelectedBytes)} <span style={{ fontSize: "0.9rem", fontWeight: 500 }}>GB</span>
+          </div>
+          <div style={{ fontSize: "0.75rem", color: "#0284c7" }}>
+            {selectedIds.length} of {items.length} files ticked
+          </div>
+        </div>
+      </div>
+
       {/* Filter and Selection Header */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, flexWrap: "wrap", gap: 8 }}>
         <div style={{ display: "flex", gap: 6 }}>
@@ -85,7 +141,7 @@ export const MediaTable: React.FC<Props> = ({
         </div>
 
         <div style={{ fontSize: "0.85rem", color: "#475569" }}>
-          Selected: <strong>{selectedIds.length}</strong> / {items.length} items
+          Selected: <strong>{selectedIds.length}</strong> / {items.length} items (<strong>{toGB(totalSelectedBytes)} GB</strong>)
         </div>
       </div>
 
