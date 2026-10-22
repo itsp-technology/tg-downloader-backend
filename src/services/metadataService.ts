@@ -1,4 +1,4 @@
-import { TelegramClient } from "telegram";
+import { TelegramClient, Api } from "telegram";
 import { formatBytes, formatDuration, sanitizeFileName } from "../utils/sanitizer.js";
 
 export interface MediaPreview {
@@ -15,17 +15,34 @@ export interface MediaPreview {
 }
 
 export async function resolveChannelEntity(client: TelegramClient, channelId: string | number): Promise<any> {
+  // 1. Direct getEntity check
   try {
     return await client.getEntity(channelId);
   } catch {
-    const dialogs = await client.getDialogs({});
-    const match = dialogs.find((d) => {
-      const idStr = String(d.id);
-      return idStr === String(channelId) || idStr.includes(String(channelId).replace("-100", ""));
-    });
-    if (match) return match.entity;
-    throw new Error(`Cannot access channel ${channelId}. Make sure you have joined this group/channel.`);
+    // If it's a public username (string without "-100"), auto-join the channel
+    if (typeof channelId === "string" && !channelId.startsWith("-100")) {
+      try {
+        await client.invoke(new Api.channels.JoinChannel({ channel: channelId }));
+        return await client.getEntity(channelId);
+      } catch {
+        // Fallback continues below
+      }
+    }
   }
+
+  // 2. Search local dialogs list
+  const dialogs = await client.getDialogs({});
+  const cleanTarget = String(channelId).replace(/^-100/, "");
+
+  const match = dialogs.find((d) => {
+    const idStr = String(d.id).replace(/^-100/, "");
+    const username = (d.entity as any)?.username;
+    return idStr === cleanTarget || (username && username.toLowerCase() === String(channelId).toLowerCase());
+  });
+
+  if (match) return match.entity;
+
+  throw new Error(`Cannot access channel '${channelId}'. If this is a private channel, make sure you have joined it in Telegram first.`);
 }
 
 export async function findMessageWithMedia(
@@ -33,7 +50,7 @@ export async function findMessageWithMedia(
   entity: any,
   targetId: number
 ): Promise<{ message: any; resolvedId: number }> {
-  // 1. First, check the direct message ID
+  // 1. Check direct message ID
   const directMessages = await client.getMessages(entity, { ids: [targetId] });
   let msg = directMessages && directMessages.length > 0 ? directMessages[0] : null;
 
@@ -41,7 +58,7 @@ export async function findMessageWithMedia(
     return { message: msg, resolvedId: targetId };
   }
 
-  // 2. If it's a topic header without media, search for replies inside this topic (replyToMsgId = targetId)
+  // 2. Search replies inside topic (replyToMsgId = targetId)
   try {
     const topicReplies = await client.getMessages(entity, {
       replyTo: targetId,
@@ -52,10 +69,10 @@ export async function findMessageWithMedia(
       return { message: mediaMsg, resolvedId: mediaMsg.id };
     }
   } catch {
-    // ReplyTo search may not be supported on all supergroups, fallback to sequential range scan
+    // Fallback continues
   }
 
-  // 3. Sequential search forward (+1 to +15): In topics, video messages typically follow immediately
+  // 3. Sequential search forward (+1 to +15)
   const forwardRange = Array.from({ length: 15 }, (_, i) => targetId + 1 + i);
   const scanMessages = await client.getMessages(entity, { ids: forwardRange });
   const found = scanMessages.find((m) => m && m.media);
@@ -85,13 +102,13 @@ export async function getMessageMetadata(
       formattedSize: "0 B",
       duration: 0,
       formattedDuration: "00:00",
-      caption: msg?.message || "No media found in topic header or neighboring messages",
+      caption: msg?.message || "No media found",
       hasMedia: false,
       thumbnailBase64: null,
     };
   }
 
-  let fileName = `Lecture_${resolvedId}`;
+  let fileName = `Media_${resolvedId}`;
   let fileSize = 0;
   let duration = 0;
 
@@ -114,7 +131,6 @@ export async function getMessageMetadata(
     fileName = `Photo_${resolvedId}.jpg`;
   }
 
-  // Extract thumbnail if available
   let thumbnailBase64: string | null = null;
   try {
     const thumbBuffer = await client.downloadMedia(msg, { thumb: 0 });
@@ -122,12 +138,12 @@ export async function getMessageMetadata(
       thumbnailBase64 = `data:image/jpeg;base64,${thumbBuffer.toString("base64")}`;
     }
   } catch {
-    // Thumbnails are optional
+    // optional thumbnail
   }
 
   return {
     channelTitle: sanitizeFileName(channelTitle),
-    messageId: resolvedId, // Return the actual media message ID
+    messageId: resolvedId,
     fileName: sanitizeFileName(fileName),
     fileSize,
     formattedSize: formatBytes(fileSize),

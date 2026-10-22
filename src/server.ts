@@ -120,7 +120,7 @@ app.post("/api/system/open-explorer", (req: Request, res: Response): any => {
 // Scan Channel or Topic for all media items (PDF, ZIP, Video, Audio)
 app.post("/api/media/scan-channel", async (req: Request, res: Response): Promise<any> => {
   try {
-    const { link, limit = 60 } = req.body;
+    const { link, limit = 80 } = req.body;
     const parsed = parseTelegramLink(link);
     if (!parsed) return res.status(400).json({ error: "Invalid Telegram link format." });
 
@@ -128,18 +128,21 @@ app.post("/api/media/scan-channel", async (req: Request, res: Response): Promise
     const entity = await resolveChannelEntity(client, parsed.channelId);
     const channelTitle = (entity as any).title || "Telegram_Channel";
 
-    // If link points to a topic ID, fetch replies to that topic
     let messages: any[] = [];
-    try {
-      messages = await client.getMessages(entity, {
-        replyTo: parsed.messageId,
-        limit: Number(limit),
-      });
-    } catch {
-      // Fallback: regular history scan
-      messages = [];
+
+    // If messageId is provided, try topic replies first
+    if (parsed.messageId) {
+      try {
+        messages = await client.getMessages(entity, {
+          replyTo: parsed.messageId,
+          limit: Number(limit),
+        });
+      } catch {
+        messages = [];
+      }
     }
 
+    // If no topic replies found or it's a root channel link, get recent channel messages
     if (!messages || messages.length === 0) {
       messages = await client.getMessages(entity, { limit: Number(limit) });
     }
@@ -167,10 +170,16 @@ app.post("/api/media/scan-channel", async (req: Request, res: Response): Promise
           fileType = "zip";
         } else if (ext === "pdf") {
           fileType = "pdf";
-        } else if (["mp4", "mkv", "avi", "mov", "webm"].includes(ext) || attributes.some((a: any) => a.className === "DocumentAttributeVideo")) {
+        } else if (
+          ["mp4", "mkv", "avi", "mov", "webm"].includes(ext) ||
+          attributes.some((a: any) => a.className === "DocumentAttributeVideo")
+        ) {
           fileType = "video";
           if (!fileName.includes(".")) fileName += ".mp4";
-        } else if (["mp3", "m4a", "flac", "wav", "ogg"].includes(ext) || attributes.some((a: any) => a.className === "DocumentAttributeAudio")) {
+        } else if (
+          ["mp3", "m4a", "flac", "wav", "ogg"].includes(ext) ||
+          attributes.some((a: any) => a.className === "DocumentAttributeAudio")
+        ) {
           fileType = "audio";
         } else {
           fileType = "document";
@@ -201,7 +210,36 @@ app.post("/api/media/scan-channel", async (req: Request, res: Response): Promise
   }
 });
 
-// Enqueue Selected Items (from Checkboxes)
+// Preview metadata before download (Handles links with or without message IDs)
+app.post("/api/media/preview", async (req: Request, res: Response): Promise<any> => {
+  try {
+    const { link } = req.body;
+    const parsed = parseTelegramLink(link);
+    if (!parsed) return res.status(400).json({ error: "Invalid Telegram link format." });
+
+    const client = await getClient();
+
+    // If it's a root channel without message ID, find the latest media message
+    let targetMsgId = parsed.messageId;
+    if (!targetMsgId) {
+      const entity = await resolveChannelEntity(client, parsed.channelId);
+      const recent = await client.getMessages(entity, { limit: 15 });
+      const withMedia = recent.find((m) => m && m.media);
+      if (withMedia) {
+        targetMsgId = withMedia.id;
+      } else {
+        return res.status(404).json({ error: "No media found in the most recent messages of this channel." });
+      }
+    }
+
+    const preview = await getMessageMetadata(client, parsed.channelId, targetMsgId);
+    return res.json(preview);
+  } catch (err: any) {
+    return res.status(500).json({ error: err?.message || "Failed to fetch metadata" });
+  }
+});
+
+// Enqueue Selected Items from Checkboxes
 app.post("/api/download/enqueue-selected", async (req: Request, res: Response): Promise<any> => {
   try {
     const { channelId, saveFolder, selectedIds } = req.body;
@@ -235,7 +273,42 @@ app.post("/api/download/enqueue-selected", async (req: Request, res: Response): 
   }
 });
 
-// Polling live progress
+// Enqueue Single or Batch Range Downloads
+app.post("/api/download/enqueue", async (req: Request, res: Response): Promise<any> => {
+  try {
+    const { link, saveFolder, endMessageId } = req.body;
+    const parsed = parseTelegramLink(link);
+    if (!parsed) return res.status(400).json({ error: "Invalid link format." });
+
+    const client = await getClient();
+    const startId = parsed.messageId || 1;
+    const endId = endMessageId ? Number(endMessageId) : startId;
+
+    const addedItems = [];
+    for (let id = startId; id <= endId; id++) {
+      const meta = await getMessageMetadata(client, parsed.channelId, id);
+      if (meta.hasMedia) {
+        const item = queueManager.addToQueue({
+          id: `${parsed.channelId}_${id}`,
+          channelId: parsed.channelId,
+          messageId: id,
+          channelTitle: meta.channelTitle,
+          fileName: meta.fileName,
+          targetFolder: saveFolder,
+          totalBytes: meta.fileSize,
+        });
+        addedItems.push(item);
+      }
+    }
+
+    queueManager.startProcessing(client);
+    return res.json({ status: "ENQUEUED", count: addedItems.length, items: addedItems });
+  } catch (err: any) {
+    return res.status(500).json({ error: err?.message || "Failed to enqueue items" });
+  }
+});
+
+// Live Queue status
 app.get("/api/download/queue-status", (_req: Request, res: Response): any => {
   return res.json(queueManager.getQueue());
 });
