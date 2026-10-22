@@ -11,6 +11,16 @@ export interface MediaPreview {
   thumbnailBase64: string | null;
 }
 
+export interface ChannelMediaItem {
+  id: number;
+  fileName: string;
+  fileSize: number;
+  formattedSize: string;
+  fileType: "video" | "document" | "zip" | "pdf" | "audio" | "other";
+  caption: string;
+  date: string;
+}
+
 export interface QueueItem {
   id: string;
   channelTitle: string;
