@@ -25,9 +25,17 @@ export interface QueueItem {
 class DownloadQueueManager {
   private queue: QueueItem[] = [];
   private isProcessing = false;
-  private shouldPauseCurrent = false;
+  private shouldStopCurrent = false;
 
   public addToQueue(item: Omit<QueueItem, "downloadedBytes" | "percentage" | "speed" | "eta" | "status">): QueueItem {
+    const existing = this.queue.find((q) => q.id === item.id);
+    if (existing) {
+      if (existing.status === "paused" || existing.status === "error") {
+        existing.status = "pending";
+      }
+      return existing;
+    }
+
     const newItem: QueueItem = {
       ...item,
       downloadedBytes: 0,
@@ -44,8 +52,18 @@ class DownloadQueueManager {
     return this.queue;
   }
 
-  public pauseCurrent(): void {
-    this.shouldPauseCurrent = true;
+  public stopCurrent(): void {
+    this.shouldStopCurrent = true;
+  }
+
+  public resumeItem(id: string, client: TelegramClient): boolean {
+    const item = this.queue.find((i) => i.id === id);
+    if (item && (item.status === "paused" || item.status === "error")) {
+      item.status = "pending";
+      this.startProcessing(client);
+      return true;
+    }
+    return false;
   }
 
   public async startProcessing(client: TelegramClient): Promise<void> {
@@ -56,7 +74,7 @@ class DownloadQueueManager {
       const pendingItem = this.queue.find((i) => i.status === "pending");
       if (!pendingItem) break;
 
-      this.shouldPauseCurrent = false;
+      this.shouldStopCurrent = false;
       await this.downloadItem(client, pendingItem);
     }
 
@@ -73,6 +91,7 @@ class DownloadQueueManager {
 
     const targetFilePath = path.join(finalDir, sanitizeFileName(item.fileName));
 
+    // Resumability check: Check existing partial file size on disk
     let startOffset = 0;
     if (fs.existsSync(targetFilePath)) {
       startOffset = fs.statSync(targetFilePath).size;
@@ -80,11 +99,17 @@ class DownloadQueueManager {
         item.status = "completed";
         item.downloadedBytes = item.totalBytes;
         item.percentage = 100;
+        item.eta = "Done";
+        item.speed = "0 MB/s";
         return;
       }
     }
 
     item.downloadedBytes = startOffset;
+    if (item.totalBytes > 0) {
+      item.percentage = Math.min(100, Math.round((startOffset / item.totalBytes) * 100));
+    }
+
     const writeStream = fs.createWriteStream(targetFilePath, { flags: startOffset > 0 ? "a" : "w" });
 
     try {
@@ -101,8 +126,10 @@ class DownloadQueueManager {
         offset: bigInt(startOffset),
         requestSize: CONFIG.CHUNK_SIZE,
       })) {
-        if (this.shouldPauseCurrent) {
+        if (this.shouldStopCurrent) {
           item.status = "paused";
+          item.speed = "0 MB/s";
+          item.eta = "Paused";
           writeStream.end();
           return;
         }

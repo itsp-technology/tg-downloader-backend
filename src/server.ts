@@ -21,7 +21,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Helper: Stream all messages from channel/topic history using GramJS iterMessages
+// Helper: Stream messages across Telegram channel history
 async function collectAllMediaMessages(
   client: any,
   entity: any,
@@ -30,14 +30,11 @@ async function collectAllMediaMessages(
   maxScan: number = 10000
 ): Promise<any[]> {
   const results: any[] = [];
-  const options: any = {
-    limit: maxScan,
-  };
+  const options: any = { limit: maxScan };
 
   if (filter) options.filter = filter;
   if (replyToMsgId) options.replyTo = replyToMsgId;
 
-  // iterMessages automatically handles MTProto chunking and pagination tokens
   for await (const message of client.iterMessages(entity, options)) {
     if (message && message.media) {
       results.push(message);
@@ -143,7 +140,7 @@ app.post("/api/system/open-explorer", (req: Request, res: Response): any => {
   return res.json({ status: "OK" });
 });
 
-// Full Channel & Topic Scan (Iterates entire history without 200-limit cap)
+// Scan Channel or Topic with Top-to-Bottom Telegram Order (Ascending ID: a.id - b.id)
 app.post("/api/media/scan-channel", async (req: Request, res: Response): Promise<any> => {
   try {
     const { link } = req.body;
@@ -157,18 +154,16 @@ app.post("/api/media/scan-channel", async (req: Request, res: Response): Promise
     const combinedMap = new Map<number, any>();
 
     if (parsed.messageId) {
-      // Topic thread scan
       try {
         const topicMessages = await collectAllMediaMessages(client, entity, undefined, parsed.messageId);
         for (const m of topicMessages) {
           if (m && m.id) combinedMap.set(m.id, m);
         }
       } catch {
-        // Fallback to general scan if topic reply fetching is restricted
+        // Fallback continues
       }
     }
 
-    // Root channel or empty topic scan: fetch all videos and documents via iterMessages
     if (combinedMap.size === 0) {
       try {
         const [videos, documents] = await Promise.all([
@@ -188,7 +183,8 @@ app.post("/api/media/scan-channel", async (req: Request, res: Response): Promise
       }
     }
 
-    const messages = Array.from(combinedMap.values()).sort((a, b) => b.id - a.id);
+    // Sort ASCENDING (a.id - b.id) so older lectures appear at the top, newer at the bottom, matching Telegram order
+    const messages = Array.from(combinedMap.values()).sort((a, b) => a.id - b.id);
 
     const items = [];
     for (const msg of messages) {
@@ -253,34 +249,6 @@ app.post("/api/media/scan-channel", async (req: Request, res: Response): Promise
   }
 });
 
-// Preview metadata before download
-app.post("/api/media/preview", async (req: Request, res: Response): Promise<any> => {
-  try {
-    const { link } = req.body;
-    const parsed = parseTelegramLink(link);
-    if (!parsed) return res.status(400).json({ error: "Invalid Telegram link format." });
-
-    const client = await getClient();
-
-    let targetMsgId = parsed.messageId;
-    if (!targetMsgId) {
-      const entity = await resolveChannelEntity(client, parsed.channelId);
-      const recent = await client.getMessages(entity, { limit: 15 });
-      const withMedia = recent.find((m) => m && m.media);
-      if (withMedia) {
-        targetMsgId = withMedia.id;
-      } else {
-        return res.status(404).json({ error: "No media found in the most recent messages of this channel." });
-      }
-    }
-
-    const preview = await getMessageMetadata(client, parsed.channelId, targetMsgId);
-    return res.json(preview);
-  } catch (err: any) {
-    return res.status(500).json({ error: err?.message || "Failed to fetch metadata" });
-  }
-});
-
 // Enqueue Selected Items from Checkboxes
 app.post("/api/download/enqueue-selected", async (req: Request, res: Response): Promise<any> => {
   try {
@@ -315,50 +283,27 @@ app.post("/api/download/enqueue-selected", async (req: Request, res: Response): 
   }
 });
 
-// Enqueue Single or Batch Range Downloads
-app.post("/api/download/enqueue", async (req: Request, res: Response): Promise<any> => {
+// Stop / Pause active download
+app.post("/api/download/stop", (_req: Request, res: Response): any => {
+  queueManager.stopCurrent();
+  return res.json({ status: "STOPPED" });
+});
+
+// Resume paused download
+app.post("/api/download/resume", async (req: Request, res: Response): Promise<any> => {
   try {
-    const { link, saveFolder, endMessageId } = req.body;
-    const parsed = parseTelegramLink(link);
-    if (!parsed) return res.status(400).json({ error: "Invalid link format." });
-
+    const { id } = req.body;
     const client = await getClient();
-    const startId = parsed.messageId || 1;
-    const endId = endMessageId ? Number(endMessageId) : startId;
-
-    const addedItems = [];
-    for (let id = startId; id <= endId; id++) {
-      const meta = await getMessageMetadata(client, parsed.channelId, id);
-      if (meta.hasMedia) {
-        const item = queueManager.addToQueue({
-          id: `${parsed.channelId}_${id}`,
-          channelId: parsed.channelId,
-          messageId: id,
-          channelTitle: meta.channelTitle,
-          fileName: meta.fileName,
-          targetFolder: saveFolder,
-          totalBytes: meta.fileSize,
-        });
-        addedItems.push(item);
-      }
-    }
-
-    queueManager.startProcessing(client);
-    return res.json({ status: "ENQUEUED", count: addedItems.length, items: addedItems });
+    const success = queueManager.resumeItem(id, client);
+    return res.json({ status: success ? "RESUMED" : "CANNOT_RESUME" });
   } catch (err: any) {
-    return res.status(500).json({ error: err?.message || "Failed to enqueue items" });
+    return res.status(500).json({ error: err?.message || "Failed to resume" });
   }
 });
 
 // Live Queue status
 app.get("/api/download/queue-status", (_req: Request, res: Response): any => {
   return res.json(queueManager.getQueue());
-});
-
-// Pause active download
-app.post("/api/download/pause", (_req: Request, res: Response): any => {
-  queueManager.pauseCurrent();
-  return res.json({ status: "PAUSED" });
 });
 
 app.listen(CONFIG.PORT, () => {

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { AuthCard } from "./components/AuthCard.js";
 import { MediaTable } from "./components/MediaTable.js";
 import { ProgressBar } from "./components/ProgressBar.js";
@@ -8,7 +8,7 @@ const API_BASE = "http://localhost:5000";
 
 export default function App(): React.JSX.Element {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
-  const [link, setLink] = useState("https://t.me/c/3641059847/18");
+  const [link, setLink] = useState("https://web.telegram.org/a/#-1003849411139");
   const [saveFolder, setSaveFolder] = useState("D:\\TelegramMedia");
   const [mediaItems, setMediaItems] = useState<ChannelMediaItem[]>([]);
   const [channelId, setChannelId] = useState<string | number>("");
@@ -17,6 +17,43 @@ export default function App(): React.JSX.Element {
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [scanning, setScanning] = useState(false);
   const [statusMsg, setStatusMsg] = useState<{ text: string; error?: boolean } | null>(null);
+  const [wakeLockActive, setWakeLockActive] = useState(false);
+  const wakeLockRef = useRef<any>(null);
+
+  // 1. Keep Laptop Awake (HTML5 Screen Wake Lock API)
+  useEffect(() => {
+    async function requestWakeLock() {
+      if ("wakeLock" in navigator) {
+        try {
+          wakeLockRef.current = await (navigator as any).wakeLock.request("screen");
+          setWakeLockActive(true);
+
+          wakeLockRef.current.addEventListener("release", () => {
+            setWakeLockActive(false);
+          });
+        } catch {
+          setWakeLockActive(false);
+        }
+      }
+    }
+
+    requestWakeLock();
+
+    // Re-acquire wake lock if tab is switched back to
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        requestWakeLock();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      if (wakeLockRef.current) {
+        wakeLockRef.current.release();
+      }
+    };
+  }, []);
 
   // Check login on load
   useEffect(() => {
@@ -26,7 +63,7 @@ export default function App(): React.JSX.Element {
       .catch(() => setIsLoggedIn(false));
   }, []);
 
-  // Poll download progress queue
+  // Poll download queue
   useEffect(() => {
     const interval = setInterval(() => {
       fetch(`${API_BASE}/api/download/queue-status`)
@@ -45,7 +82,7 @@ export default function App(): React.JSX.Element {
 
   const handleScanChannel = async () => {
     setScanning(true);
-    setStatusMsg({ text: "Scanning channel/topic for media..." });
+    setStatusMsg({ text: "Scanning all files in Telegram chronological order..." });
     setMediaItems([]);
     setSelectedIds([]);
 
@@ -53,7 +90,7 @@ export default function App(): React.JSX.Element {
       const res = await fetch(`${API_BASE}/api/media/scan-channel`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ link, limit: 60 }),
+        body: JSON.stringify({ link }),
       });
       const data = await res.json();
 
@@ -107,6 +144,20 @@ export default function App(): React.JSX.Element {
     }
   };
 
+  const handleStopDownload = async () => {
+    await fetch(`${API_BASE}/api/download/stop`, { method: "POST" });
+    setStatusMsg({ text: "Download stopping / pausing..." });
+  };
+
+  const handleResumeDownload = async (id: string) => {
+    await fetch(`${API_BASE}/api/download/resume`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+    setStatusMsg({ text: "Resuming download..." });
+  };
+
   const handleOpenExplorer = (folder: string) => {
     fetch(`${API_BASE}/api/system/open-explorer`, {
       method: "POST",
@@ -121,8 +172,22 @@ export default function App(): React.JSX.Element {
   };
 
   return (
-    <div style={{ maxWidth: 700, margin: "30px auto", fontFamily: "system-ui, sans-serif", padding: "0 16px" }}>
-      <h2>Telegram Media Downloader Suite</h2>
+    <div style={{ maxWidth: 720, margin: "30px auto", fontFamily: "system-ui, sans-serif", padding: "0 16px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+        <h2 style={{ margin: 0, color: "#0f172a" }}>Telegram Media Suite</h2>
+        <span
+          style={{
+            fontSize: "0.8rem",
+            padding: "4px 8px",
+            borderRadius: 4,
+            backgroundColor: wakeLockActive ? "#dcfce7" : "#f1f5f9",
+            color: wakeLockActive ? "#166534" : "#64748b",
+            fontWeight: 600,
+          }}
+        >
+          {wakeLockActive ? "☕ Keep-Awake: ON (Laptop won't sleep)" : "☕ Keep-Awake: Ready"}
+        </span>
+      </div>
 
       <AuthCard
         apiBase={API_BASE}
@@ -139,7 +204,7 @@ export default function App(): React.JSX.Element {
               style={{ flex: 1, padding: 8, borderRadius: 4, border: "1px solid #cbd5e1" }}
               value={link}
               onChange={(e) => setLink(e.target.value)}
-              placeholder="https://t.me/c/3641059847/18"
+              placeholder="https://web.telegram.org/a/#-1003849411139"
             />
             <button
               onClick={handleScanChannel}
@@ -204,7 +269,8 @@ export default function App(): React.JSX.Element {
           <ProgressBar
             items={queue}
             onOpenExplorer={handleOpenExplorer}
-            onPause={() => fetch(`${API_BASE}/api/download/pause`, { method: "POST" })}
+            onStop={handleStopDownload}
+            onResume={handleResumeDownload}
           />
         </div>
       )}
