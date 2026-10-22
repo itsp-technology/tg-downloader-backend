@@ -21,6 +21,32 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Helper: Stream all messages from channel/topic history using GramJS iterMessages
+async function collectAllMediaMessages(
+  client: any,
+  entity: any,
+  filter?: any,
+  replyToMsgId?: number,
+  maxScan: number = 10000
+): Promise<any[]> {
+  const results: any[] = [];
+  const options: any = {
+    limit: maxScan,
+  };
+
+  if (filter) options.filter = filter;
+  if (replyToMsgId) options.replyTo = replyToMsgId;
+
+  // iterMessages automatically handles MTProto chunking and pagination tokens
+  for await (const message of client.iterMessages(entity, options)) {
+    if (message && message.media) {
+      results.push(message);
+    }
+  }
+
+  return results;
+}
+
 // Check current authorization status
 app.get("/api/auth/status", async (_req: Request, res: Response): Promise<any> => {
   try {
@@ -117,10 +143,10 @@ app.post("/api/system/open-explorer", (req: Request, res: Response): any => {
   return res.json({ status: "OK" });
 });
 
-// Scan Channel or Topic for all media items (PDF, ZIP, Video, Audio)
+// Full Channel & Topic Scan (Iterates entire history without 200-limit cap)
 app.post("/api/media/scan-channel", async (req: Request, res: Response): Promise<any> => {
   try {
-    const { link, limit = 80 } = req.body;
+    const { link } = req.body;
     const parsed = parseTelegramLink(link);
     if (!parsed) return res.status(400).json({ error: "Invalid Telegram link format." });
 
@@ -128,24 +154,41 @@ app.post("/api/media/scan-channel", async (req: Request, res: Response): Promise
     const entity = await resolveChannelEntity(client, parsed.channelId);
     const channelTitle = (entity as any).title || "Telegram_Channel";
 
-    let messages: any[] = [];
+    const combinedMap = new Map<number, any>();
 
-    // If messageId is provided, try topic replies first
     if (parsed.messageId) {
+      // Topic thread scan
       try {
-        messages = await client.getMessages(entity, {
-          replyTo: parsed.messageId,
-          limit: Number(limit),
-        });
+        const topicMessages = await collectAllMediaMessages(client, entity, undefined, parsed.messageId);
+        for (const m of topicMessages) {
+          if (m && m.id) combinedMap.set(m.id, m);
+        }
       } catch {
-        messages = [];
+        // Fallback to general scan if topic reply fetching is restricted
       }
     }
 
-    // If no topic replies found or it's a root channel link, get recent channel messages
-    if (!messages || messages.length === 0) {
-      messages = await client.getMessages(entity, { limit: Number(limit) });
+    // Root channel or empty topic scan: fetch all videos and documents via iterMessages
+    if (combinedMap.size === 0) {
+      try {
+        const [videos, documents] = await Promise.all([
+          collectAllMediaMessages(client, entity, new Api.InputMessagesFilterVideo()),
+          collectAllMediaMessages(client, entity, new Api.InputMessagesFilterDocument()),
+        ]);
+
+        for (const m of [...videos, ...documents]) {
+          if (m && m.id) combinedMap.set(m.id, m);
+        }
+      } catch (err: any) {
+        console.warn("Filtered iterator error, performing raw scan:", err?.message);
+        const rawMessages = await collectAllMediaMessages(client, entity);
+        for (const m of rawMessages) {
+          if (m && m.id) combinedMap.set(m.id, m);
+        }
+      }
     }
+
+    const messages = Array.from(combinedMap.values()).sort((a, b) => b.id - a.id);
 
     const items = [];
     for (const msg of messages) {
@@ -210,7 +253,7 @@ app.post("/api/media/scan-channel", async (req: Request, res: Response): Promise
   }
 });
 
-// Preview metadata before download (Handles links with or without message IDs)
+// Preview metadata before download
 app.post("/api/media/preview", async (req: Request, res: Response): Promise<any> => {
   try {
     const { link } = req.body;
@@ -219,7 +262,6 @@ app.post("/api/media/preview", async (req: Request, res: Response): Promise<any>
 
     const client = await getClient();
 
-    // If it's a root channel without message ID, find the latest media message
     let targetMsgId = parsed.messageId;
     if (!targetMsgId) {
       const entity = await resolveChannelEntity(client, parsed.channelId);
