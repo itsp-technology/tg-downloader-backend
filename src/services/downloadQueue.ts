@@ -66,6 +66,24 @@ class DownloadQueueManager {
     return false;
   }
 
+  /**
+   * Cleans up all completed items from the active list
+   */
+  public clearCompleted(): number {
+    const initialCount = this.queue.length;
+    this.queue = this.queue.filter((item) => item.status !== "completed");
+    return initialCount - this.queue.length;
+  }
+
+  /**
+   * Cleans up an individual completed item by ID
+   */
+  public removeQueueItem(id: string): boolean {
+    const initialLength = this.queue.length;
+    this.queue = this.queue.filter((item) => item.id !== id || item.status === "downloading");
+    return this.queue.length !== initialLength;
+  }
+
   public async startProcessing(client: TelegramClient): Promise<void> {
     if (this.isProcessing) return;
     this.isProcessing = true;

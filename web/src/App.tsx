@@ -110,7 +110,7 @@ export default function App(): React.JSX.Element {
 
       // Default: Select all items
       setSelectedIds(data.items.map((i: ChannelMediaItem) => i.id));
-      
+
       const totalGB = (
         data.items.reduce((sum: number, i: ChannelMediaItem) => sum + (i.fileSize || 0), 0) /
         (1024 * 1024 * 1024)
@@ -172,6 +172,19 @@ export default function App(): React.JSX.Element {
       body: JSON.stringify({ id }),
     });
     setStatusMsg({ text: "Resuming download..." });
+  };
+
+  const handleClearCompleted = async () => {
+    await fetch(`${API_BASE}/api/download/clear-completed`, { method: "POST" });
+    setStatusMsg({ text: "Cleaned completed downloads from the queue." });
+  };
+
+  const handleRemoveItem = async (id: string) => {
+    await fetch(`${API_BASE}/api/download/remove-item`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
   };
 
   const handleOpenExplorer = (folder: string) => {
@@ -287,6 +300,8 @@ export default function App(): React.JSX.Element {
             onOpenExplorer={handleOpenExplorer}
             onStop={handleStopDownload}
             onResume={handleResumeDownload}
+            onClearCompleted={handleClearCompleted}
+            onRemoveItem={handleRemoveItem}
           />
         </div>
       )}

@@ -140,7 +140,7 @@ app.post("/api/system/open-explorer", (req: Request, res: Response): any => {
   return res.json({ status: "OK" });
 });
 
-// Scan Channel or Topic with Top-to-Bottom Telegram Order (Ascending ID: a.id - b.id)
+// Scan Channel or Topic with Top-to-Bottom Telegram Order
 app.post("/api/media/scan-channel", async (req: Request, res: Response): Promise<any> => {
   try {
     const { link } = req.body;
@@ -183,7 +183,7 @@ app.post("/api/media/scan-channel", async (req: Request, res: Response): Promise
       }
     }
 
-    // Sort ASCENDING (a.id - b.id) so older lectures appear at the top, newer at the bottom, matching Telegram order
+    // Sort ASCENDING (a.id - b.id) for top-to-bottom reading order
     const messages = Array.from(combinedMap.values()).sort((a, b) => a.id - b.id);
 
     const items = [];
@@ -299,6 +299,20 @@ app.post("/api/download/resume", async (req: Request, res: Response): Promise<an
   } catch (err: any) {
     return res.status(500).json({ error: err?.message || "Failed to resume" });
   }
+});
+
+// Clean up all completed items from queue
+app.post("/api/download/clear-completed", (_req: Request, res: Response): any => {
+  const removedCount = queueManager.clearCompleted();
+  return res.json({ status: "CLEARED", removedCount });
+});
+
+// Clean up single item
+app.post("/api/download/remove-item", (req: Request, res: Response): any => {
+  const { id } = req.body;
+  if (!id) return res.status(400).json({ error: "id is required" });
+  const success = queueManager.removeQueueItem(id);
+  return res.json({ status: success ? "REMOVED" : "NOT_FOUND" });
 });
 
 // Live Queue status
