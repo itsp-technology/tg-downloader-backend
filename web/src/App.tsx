@@ -126,6 +126,15 @@ export default function App(): React.JSX.Element {
     }
   };
 
+  // Feature: Clear All Scanned Files
+  const handleClearScannedList = () => {
+    setMediaItems([]);
+    setSelectedIds([]);
+    setChannelId("");
+    setChannelTitle("");
+    setStatusMsg({ text: "Scanned files list cleared." });
+  };
+
   const handleToggleSelect = (id: number) => {
     setSelectedIds((prev) =>
       prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
@@ -267,6 +276,29 @@ export default function App(): React.JSX.Element {
 
           {mediaItems.length > 0 && (
             <>
+              {/* Header with Title and Clear Scanned List Button */}
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 8 }}>
+                <span style={{ fontSize: "0.95rem", fontWeight: 700, color: "#1e293b" }}>
+                  Channel: {channelTitle} ({mediaItems.length} files)
+                </span>
+                <button
+                  type="button"
+                  onClick={handleClearScannedList}
+                  style={{
+                    padding: "4px 10px",
+                    fontSize: "0.8rem",
+                    backgroundColor: "#fee2e2",
+                    color: "#b91c1c",
+                    border: "1px solid #fecaca",
+                    borderRadius: 4,
+                    cursor: "pointer",
+                    fontWeight: 600,
+                  }}
+                >
+                  🗑️ Clear Scanned List
+                </button>
+              </div>
+
               <MediaTable
                 items={mediaItems}
                 selectedIds={selectedIds}
