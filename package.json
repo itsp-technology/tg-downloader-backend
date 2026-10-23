@@ -1,32 +1,25 @@
 {
-  "name": "tg-downloader-ts",
+  "name": "tg-downloader-backend",
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev:server": "tsx watch src/server.ts",
-    "dev:web": "npm --prefix web run dev",
-    "build": "tsc"
+    "server": "tsx watch src/server.ts",
+    "web": "npm --prefix web run dev",
+    "dev": "concurrently -n \"SERVER,WEB\" -c \"blue,green\" \"npm run server\" \"npm run web\"",
+    "build": "npm --prefix web run build && tsc"
   },
-  "description": "",
-  "main": "index.js",
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "dependencies": {
-    "cors": "^2.8.6",
-    "express": "^5.3.0",
-    "input": "^1.0.1",
-    "react": "^19.3.1",
-    "react-dom": "^19.3.1",
-    "telegram": "^2.26.22"
+    "big-integer": "^1.6.52",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "telegram": "^2.22.2"
   },
   "devDependencies": {
-    "@types/cors": "^2.8.19",
-    "@types/express": "^5.0.6",
-    "@types/node": "^26.6.5",
-    "@types/react": "^19.3.0",
-    "@types/react-dom": "^19.3.0",
-    "tsx": "^4.23.15",
-    "typescript": "^7.0.2"
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.9",
+    "concurrently": "^8.2.2",
+    "tsx": "^4.16.2",
+    "typescript": "^5.5.3"
   }
 }
