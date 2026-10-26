@@ -1,11 +1,12 @@
 import express, { Request, Response } from "express";
 import cors from "cors";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Api } from "telegram";
 import { StringSession } from "telegram/sessions/index.js";
 import { CONFIG } from "./config.js";
 import { parseTelegramLink } from "./utils/linkParser.js";
-import { openFolderPicker, openInExplorer } from "./utils/system.js";
-import { formatBytes, sanitizeFileName } from "./utils/sanitizer.js";
+import { sanitizeFileName } from "./utils/sanitizer.js";
 import {
   getClient,
   loadSavedSession,
@@ -14,45 +15,26 @@ import {
   setPendingAuth,
   getPendingAuth,
 } from "./services/telegramClient.js";
-import { getMessageMetadata, resolveChannelEntity } from "./services/metadataService.js";
-import { queueManager } from "./services/downloadQueue.js";
+import { resolveChannelEntity, findMessageWithMedia } from "./services/metadataService.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Helper: Stream messages across Telegram channel history
-async function collectAllMediaMessages(
-  client: any,
-  entity: any,
-  filter?: any,
-  replyToMsgId?: number,
-  maxScan: number = 10000
-): Promise<any[]> {
-  const results: any[] = [];
-  const options: any = { limit: maxScan };
+// Serve static React build files
+const clientDistPath = path.resolve(__dirname, "../web/dist");
+app.use(express.static(clientDistPath));
 
-  if (filter) options.filter = filter;
-  if (replyToMsgId) options.replyTo = replyToMsgId;
-
-  for await (const message of client.iterMessages(entity, options)) {
-    if (message && message.media) {
-      results.push(message);
-    }
-  }
-
-  return results;
-}
-
-// Check current authorization status
+// Auth Status
 app.get("/api/auth/status", async (_req: Request, res: Response): Promise<any> => {
   try {
     const hasSaved = Boolean(loadSavedSession());
     if (!hasSaved) return res.json({ authorized: false });
-
     const client = await getClient();
-    const isAuth = await client.isUserAuthorized();
-    return res.json({ authorized: isAuth });
+    return res.json({ authorized: await client.isUserAuthorized() });
   } catch {
     return res.json({ authorized: false });
   }
@@ -63,17 +45,10 @@ app.post("/api/auth/send-code", async (req: Request, res: Response): Promise<any
   try {
     const { apiId, apiHash, phone } = req.body;
     const client = await getClient(Number(apiId), String(apiHash));
-
-    if (await client.isUserAuthorized()) {
-      return res.json({ status: "AUTHORIZED" });
-    }
+    if (await client.isUserAuthorized()) return res.json({ status: "AUTHORIZED" });
 
     const cleanPhone = String(phone).trim();
-    const result = await client.sendCode(
-      { apiId: Number(apiId), apiHash: String(apiHash) },
-      cleanPhone
-    );
-
+    const result = await client.sendCode({ apiId: Number(apiId), apiHash: String(apiHash) }, cleanPhone);
     setPendingAuth(cleanPhone, result.phoneCodeHash);
     return res.json({ status: "CODE_SENT" });
   } catch (err: any) {
@@ -122,25 +97,13 @@ app.post("/api/auth/verify-password", async (req: Request, res: Response): Promi
   }
 });
 
-// Auth Logout
+// Logout
 app.post("/api/auth/logout", async (_req: Request, res: Response): Promise<any> => {
   deleteSavedSession();
   return res.json({ status: "LOGGED_OUT" });
 });
 
-// System utilities
-app.get("/api/system/browse-folder", async (_req: Request, res: Response): Promise<any> => {
-  const selected = await openFolderPicker();
-  return res.json({ selectedFolder: selected });
-});
-
-app.post("/api/system/open-explorer", (req: Request, res: Response): any => {
-  const { folderPath } = req.body;
-  if (folderPath) openInExplorer(folderPath);
-  return res.json({ status: "OK" });
-});
-
-// Scan Channel or Topic with Top-to-Bottom Telegram Order
+// Scan Channel
 app.post("/api/media/scan-channel", async (req: Request, res: Response): Promise<any> => {
   try {
     const { link } = req.body;
@@ -152,73 +115,44 @@ app.post("/api/media/scan-channel", async (req: Request, res: Response): Promise
     const channelTitle = (entity as any).title || "Telegram_Channel";
 
     const combinedMap = new Map<number, any>();
+    const options: any = { limit: 10000 };
 
     if (parsed.messageId) {
       try {
-        const topicMessages = await collectAllMediaMessages(client, entity, undefined, parsed.messageId);
-        for (const m of topicMessages) {
-          if (m && m.id) combinedMap.set(m.id, m);
+        for await (const m of client.iterMessages(entity, { ...options, replyTo: parsed.messageId })) {
+          if (m?.media) combinedMap.set(m.id, m);
         }
-      } catch {
-        // Fallback continues
-      }
+      } catch {}
     }
 
     if (combinedMap.size === 0) {
-      try {
-        const [videos, documents] = await Promise.all([
-          collectAllMediaMessages(client, entity, new Api.InputMessagesFilterVideo()),
-          collectAllMediaMessages(client, entity, new Api.InputMessagesFilterDocument()),
-        ]);
-
-        for (const m of [...videos, ...documents]) {
-          if (m && m.id) combinedMap.set(m.id, m);
-        }
-      } catch (err: any) {
-        console.warn("Filtered iterator error, performing raw scan:", err?.message);
-        const rawMessages = await collectAllMediaMessages(client, entity);
-        for (const m of rawMessages) {
-          if (m && m.id) combinedMap.set(m.id, m);
-        }
+      for await (const m of client.iterMessages(entity, options)) {
+        if (m?.media) combinedMap.set(m.id, m);
       }
     }
 
-    // Sort ASCENDING (a.id - b.id) for top-to-bottom reading order
     const messages = Array.from(combinedMap.values()).sort((a, b) => a.id - b.id);
-
-    const items = [];
-    for (const msg of messages) {
-      if (!msg || !msg.media) continue;
-
+    const items = messages.map((msg) => {
       let fileName = `Media_${msg.id}`;
       let fileSize = 0;
       let fileType: "video" | "document" | "zip" | "pdf" | "audio" | "other" = "other";
 
-      if ("document" in msg.media && (msg.media as any).document) {
-        const doc = (msg.media as any).document;
+      if ("document" in msg.media && msg.media.document) {
+        const doc = msg.media.document;
         fileSize = Number(doc.size) || 0;
-        const attributes = doc.attributes || [];
-
-        const fileAttr = attributes.find((a: any) => a.fileName);
-        if (fileAttr && fileAttr.fileName) {
-          fileName = fileAttr.fileName;
-        }
+        const attr = doc.attributes?.find((a: any) => a.fileName);
+        if (attr?.fileName) fileName = attr.fileName;
 
         const ext = fileName.split(".").pop()?.toLowerCase() || "";
-        if (["zip", "rar", "7z", "tar", "gz"].includes(ext)) {
-          fileType = "zip";
-        } else if (ext === "pdf") {
-          fileType = "pdf";
-        } else if (
-          ["mp4", "mkv", "avi", "mov", "webm"].includes(ext) ||
-          attributes.some((a: any) => a.className === "DocumentAttributeVideo")
+        if (["zip", "rar", "7z", "tar", "gz"].includes(ext)) fileType = "zip";
+        else if (ext === "pdf") fileType = "pdf";
+        else if (
+          ["mp4", "mkv", "webm", "avi"].includes(ext) ||
+          doc.attributes?.some((a: any) => a.className === "DocumentAttributeVideo")
         ) {
           fileType = "video";
           if (!fileName.includes(".")) fileName += ".mp4";
-        } else if (
-          ["mp3", "m4a", "flac", "wav", "ogg"].includes(ext) ||
-          attributes.some((a: any) => a.className === "DocumentAttributeAudio")
-        ) {
+        } else if (["mp3", "m4a", "wav"].includes(ext) || doc.attributes?.some((a: any) => a.className === "DocumentAttributeAudio")) {
           fileType = "audio";
         } else {
           fileType = "document";
@@ -228,98 +162,71 @@ app.post("/api/media/scan-channel", async (req: Request, res: Response): Promise
         fileType = "other";
       }
 
-      items.push({
+      return {
         id: msg.id,
         fileName: sanitizeFileName(fileName),
         fileSize,
-        formattedSize: formatBytes(fileSize),
+        formattedSize: `${(fileSize / (1024 * 1024)).toFixed(2)} MB`,
         fileType,
         caption: msg.message || "",
         date: new Date((msg.date || 0) * 1000).toLocaleDateString(),
-      });
-    }
-
-    return res.json({
-      channelTitle: sanitizeFileName(channelTitle),
-      channelId: parsed.channelId,
-      items,
+      };
     });
+
+    return res.json({ channelTitle: sanitizeFileName(channelTitle), channelId: parsed.channelId, items });
   } catch (err: any) {
-    return res.status(500).json({ error: err?.message || "Failed to scan channel media" });
+    return res.status(500).json({ error: err?.message || "Failed to scan channel" });
   }
 });
 
-// Enqueue Selected Items from Checkboxes
-app.post("/api/download/enqueue-selected", async (req: Request, res: Response): Promise<any> => {
+// Pass-Through Stream (0 Bytes Server Storage)
+app.get("/api/download/stream", async (req: Request, res: Response): Promise<any> => {
   try {
-    const { channelId, saveFolder, selectedIds } = req.body;
-    if (!channelId || !selectedIds || !Array.isArray(selectedIds) || selectedIds.length === 0) {
-      return res.status(400).json({ error: "Please select at least one item to download." });
-    }
+    const { channelId, messageId } = req.query;
+    if (!channelId || !messageId) return res.status(400).send("channelId and messageId required");
 
     const client = await getClient();
-    const addedItems = [];
+    const entity = await resolveChannelEntity(client, String(channelId));
+    const { message: msg } = await findMessageWithMedia(client, entity, Number(messageId));
 
-    for (const msgId of selectedIds) {
-      const meta = await getMessageMetadata(client, channelId, Number(msgId));
-      if (meta.hasMedia) {
-        const item = queueManager.addToQueue({
-          id: `${channelId}_${msgId}`,
-          channelId,
-          messageId: Number(msgId),
-          channelTitle: meta.channelTitle,
-          fileName: meta.fileName,
-          targetFolder: saveFolder,
-          totalBytes: meta.fileSize,
-        });
-        addedItems.push(item);
-      }
+    if (!msg || !msg.media) return res.status(404).send("Media not found");
+
+    let fileName = `Telegram_File_${messageId}`;
+    let fileSize = 0;
+
+    if ("document" in msg.media && msg.media.document) {
+      fileSize = Number(msg.media.document.size) || 0;
+      const attr = msg.media.document.attributes?.find((a: any) => a.fileName);
+      if (attr?.fileName) fileName = attr.fileName;
+    } else if ("photo" in msg.media) {
+      fileName = `Photo_${messageId}.jpg`;
     }
 
-    queueManager.startProcessing(client);
-    return res.json({ status: "ENQUEUED", count: addedItems.length, items: addedItems });
+    const safeName = sanitizeFileName(fileName);
+    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(safeName)}"`);
+    res.setHeader("Content-Type", "application/octet-stream");
+    if (fileSize > 0) res.setHeader("Content-Length", fileSize);
+
+    for await (const chunk of client.iterDownload({
+      file: msg.media,
+      requestSize: 512 * 1024,
+    })) {
+      if (res.writableEnded || res.closed) break;
+      res.write(chunk);
+    }
+
+    res.end();
   } catch (err: any) {
-    return res.status(500).json({ error: err?.message || "Failed to enqueue selected items" });
+    if (!res.headersSent) res.status(500).send(err?.message || "Stream failed");
   }
 });
 
-// Stop / Pause active download
-app.post("/api/download/stop", (_req: Request, res: Response): any => {
-  queueManager.stopCurrent();
-  return res.json({ status: "STOPPED" });
+// Express 5 compatible catch-all route for SPA client routing
+app.get("/{*splat}", (_req: Request, res: Response) => {
+  res.sendFile(path.join(clientDistPath, "index.html"));
 });
 
-// Resume paused download
-app.post("/api/download/resume", async (req: Request, res: Response): Promise<any> => {
-  try {
-    const { id } = req.body;
-    const client = await getClient();
-    const success = queueManager.resumeItem(id, client);
-    return res.json({ status: success ? "RESUMED" : "CANNOT_RESUME" });
-  } catch (err: any) {
-    return res.status(500).json({ error: err?.message || "Failed to resume" });
-  }
-});
-
-// Clean up all completed items from queue
-app.post("/api/download/clear-completed", (_req: Request, res: Response): any => {
-  const removedCount = queueManager.clearCompleted();
-  return res.json({ status: "CLEARED", removedCount });
-});
-
-// Clean up single item
-app.post("/api/download/remove-item", (req: Request, res: Response): any => {
-  const { id } = req.body;
-  if (!id) return res.status(400).json({ error: "id is required" });
-  const success = queueManager.removeQueueItem(id);
-  return res.json({ status: success ? "REMOVED" : "NOT_FOUND" });
-});
-
-// Live Queue status
-app.get("/api/download/queue-status", (_req: Request, res: Response): any => {
-  return res.json(queueManager.getQueue());
-});
-
-app.listen(CONFIG.PORT, () => {
-  console.log(`Telegram Modular Service listening on http://localhost:${CONFIG.PORT}`);
+const PORT = process.env.PORT || CONFIG.PORT || 5000;
+app.listen(PORT, () => {
+  console.log(`Telegram Server listening on http://localhost:${PORT}`);
 });
