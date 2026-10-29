@@ -180,9 +180,10 @@ app.post("/api/media/scan-channel", async (req: Request, res: Response): Promise
 });
 
 // Pass-Through Stream (0 Bytes Server Storage)
+// Pass-Through Stream (0 Bytes Server Storage + True Byte Resumption)
 app.get("/api/download/stream", async (req: Request, res: Response): Promise<any> => {
   try {
-    const { channelId, messageId } = req.query;
+    const { channelId, messageId, offset = 0 } = req.query;
     if (!channelId || !messageId) return res.status(400).send("channelId and messageId required");
 
     const client = await getClient();
@@ -203,12 +204,18 @@ app.get("/api/download/stream", async (req: Request, res: Response): Promise<any
     }
 
     const safeName = sanitizeFileName(fileName);
+    const startByte = Number(offset) || 0;
+
     res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(safeName)}"`);
     res.setHeader("Content-Type", "application/octet-stream");
-    if (fileSize > 0) res.setHeader("Content-Length", fileSize);
+    if (fileSize > 0) {
+      res.setHeader("Content-Length", fileSize - startByte);
+    }
 
+    // Stream from Telegram starting from startByte directly to user's browser
     for await (const chunk of client.iterDownload({
       file: msg.media,
+      offset: (await import("big-integer")).default(startByte),
       requestSize: 512 * 1024,
     })) {
       if (res.writableEnded || res.closed) break;

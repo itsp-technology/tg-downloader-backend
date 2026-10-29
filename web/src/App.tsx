@@ -1,19 +1,10 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import { AuthCard } from "./components/AuthCard.js";
 import { MediaTable } from "./components/MediaTable.js";
+import { DownloadQueueList, QueueItemState } from "./components/DownloadQueueList.js";
 import { ChannelMediaItem } from "./types.js";
 
-const API_BASE = ""; // Relative path to Render backend
-
-interface LocalDownloadProgress {
-  id: number;
-  fileName: string;
-  totalBytes: number;
-  downloadedBytes: number;
-  percentage: number;
-  speed: string;
-  status: "pending" | "downloading" | "completed" | "error" | "stopped";
-}
+const API_BASE = "http://localhost:5000"; // Relative path to backend
 
 export default function App(): React.JSX.Element {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
@@ -26,25 +17,90 @@ export default function App(): React.JSX.Element {
   const [statusMsg, setStatusMsg] = useState<{ text: string; error?: boolean } | null>(null);
   const [wakeLockActive, setWakeLockActive] = useState(false);
   const [localDirectoryHandle, setLocalDirectoryHandle] = useState<any>(null);
-  const [localQueue, setLocalQueue] = useState<LocalDownloadProgress[]>([]);
-  const isCancelledRef = useRef(false);
+  const [queue, setQueue] = useState<QueueItemState[]>([]);
 
-  // 1. Keep Laptop Awake (No Sleep)
-  useEffect(() => {
-    let wakeLock: any = null;
-    async function requestWakeLock() {
-      if ("wakeLock" in navigator) {
-        try {
-          wakeLock = await (navigator as any).wakeLock.request("screen");
+  // AbortControllers map for individual row cancellations
+  const abortControllersRef = useRef<Map<number, AbortController>>(new Map());
+  const wakeLockSentinelRef = useRef<any>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+
+  // ----------------------------------------------------
+  // ROBUST SYSTEM KEEP-AWAKE (Dual Screen Lock + Audio Node)
+  // ----------------------------------------------------
+  const acquireWakeLock = async () => {
+    // 1. Acquire Browser Screen WakeLock
+    if ("wakeLock" in navigator) {
+      try {
+        if (!wakeLockSentinelRef.current || wakeLockSentinelRef.current.released) {
+          const sentinel = await (navigator as any).wakeLock.request("screen");
+          wakeLockSentinelRef.current = sentinel;
           setWakeLockActive(true);
-        } catch {
-          setWakeLockActive(false);
+
+          sentinel.addEventListener("release", () => {
+            setWakeLockActive(false);
+          });
         }
+      } catch {
+        // NotAllowedError if document is not visible or user has not interacted yet
       }
     }
-    requestWakeLock();
+
+    // 2. Start Silent Web Audio Loop (Prevents OS CPU sleep even when minimized/tab inactive)
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (AudioCtx && (!audioContextRef.current || audioContextRef.current.state === "suspended")) {
+        if (!audioContextRef.current) {
+          const ctx = new AudioCtx();
+          const oscillator = ctx.createOscillator();
+          const gainNode = ctx.createGain();
+
+          oscillator.type = "sine";
+          oscillator.frequency.value = 440;
+          gainNode.gain.value = 0.0001; // Silent
+
+          oscillator.connect(gainNode);
+          gainNode.connect(ctx.destination);
+          oscillator.start();
+
+          audioContextRef.current = ctx;
+        } else if (audioContextRef.current.state === "suspended") {
+          await audioContextRef.current.resume();
+        }
+      }
+    } catch {
+      // AudioContext policy fallback
+    }
+  };
+
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        acquireWakeLock();
+      }
+    };
+
+    const handleUserInteraction = () => {
+      acquireWakeLock();
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("focus", handleVisibilityChange);
+    window.addEventListener("click", handleUserInteraction, { once: true });
+    window.addEventListener("keydown", handleUserInteraction, { once: true });
+
+    acquireWakeLock();
+
     return () => {
-      if (wakeLock) wakeLock.release();
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("focus", handleVisibilityChange);
+      window.removeEventListener("click", handleUserInteraction);
+      window.removeEventListener("keydown", handleUserInteraction);
+      if (wakeLockSentinelRef.current) {
+        wakeLockSentinelRef.current.release().catch(() => {});
+      }
+      if (audioContextRef.current) {
+        audioContextRef.current.close().catch(() => {});
+      }
     };
   }, []);
 
@@ -67,6 +123,7 @@ export default function App(): React.JSX.Element {
 
   // Pick Local Destination Folder on User's PC
   const handlePickLocalFolder = async () => {
+    await acquireWakeLock();
     if ("showDirectoryPicker" in window) {
       try {
         const handle = await (window as any).showDirectoryPicker();
@@ -81,6 +138,7 @@ export default function App(): React.JSX.Element {
   };
 
   const handleScanChannel = async () => {
+    await acquireWakeLock();
     setScanning(true);
     setStatusMsg({ text: "Scanning all files in Telegram chronological order..." });
     setMediaItems([]);
@@ -105,7 +163,7 @@ export default function App(): React.JSX.Element {
         (1024 * 1024 * 1024)
       ).toFixed(2);
 
-      setStatusMsg({ text: `Found ${data.items.length} media files in "${data.channelTitle}" (${totalGB} GB total)` });
+      setStatusMsg({ text: `Found ${data.items.length} media files in "${data.channelTitle}" (${totalGB} GB total). Ready to download.` });
     } catch (e: any) {
       setStatusMsg({ text: e.message || "Failed to scan channel", error: true });
     } finally {
@@ -123,129 +181,169 @@ export default function App(): React.JSX.Element {
     setSelectedIds((prev) => (prev.includes(id) ? prev.filter((i) => i !== id) : [...prev, id]));
   };
 
-  // Direct Local Disk Stream (0 Cloud Space Used)
-  const handleStartLocalDownload = async () => {
+  // --------------------------------------------------------------------------
+  // STREAM DOWNLOAD ENGINE: Handles Stop, Resume, and Cancel via File System API
+  // --------------------------------------------------------------------------
+  const downloadFileStream = async (item: QueueItemState, startOffset: number = 0) => {
+    let dirHandle = localDirectoryHandle;
+    if (!dirHandle && "showDirectoryPicker" in window) {
+      try {
+        dirHandle = await (window as any).showDirectoryPicker();
+        setLocalDirectoryHandle(dirHandle);
+      } catch {
+        return;
+      }
+    }
+
+    const abortController = new AbortController();
+    abortControllersRef.current.set(item.id, abortController);
+
+    setQueue((prev) =>
+      prev.map((q) => (q.id === item.id ? { ...q, status: "downloading" } : q))
+    );
+
+    try {
+      const streamUrl = `${API_BASE}/api/download/stream?channelId=${encodeURIComponent(String(channelId))}&messageId=${item.id}&offset=${startOffset}`;
+
+      if (dirHandle) {
+        const fileHandle = await dirHandle.getFileHandle(item.fileName, { create: true });
+        const writable = await fileHandle.createWritable({ keepExistingData: startOffset > 0 });
+
+        if (startOffset > 0) {
+          await writable.seek(startOffset);
+        }
+
+        const response = await fetch(streamUrl, { signal: abortController.signal });
+        if (!response.body) throw new Error("Empty stream body");
+
+        const reader = response.body.getReader();
+        let downloaded = startOffset;
+        let lastTime = Date.now();
+        let lastBytes = startOffset;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          await writable.write(value);
+          downloaded += value.length;
+
+          const now = Date.now();
+          if (now - lastTime >= 800) {
+            const diffSec = (now - lastTime) / 1000;
+            const bytesPerSec = (downloaded - lastBytes) / diffSec;
+            const speed = `${(bytesPerSec / (1024 * 1024)).toFixed(2)} MB/s`;
+
+            let eta = "--";
+            if (bytesPerSec > 0 && item.totalBytes > downloaded) {
+              const remSec = Math.round((item.totalBytes - downloaded) / bytesPerSec);
+              eta = `${Math.floor(remSec / 60)}m ${remSec % 60}s`;
+            }
+
+            lastBytes = downloaded;
+            lastTime = now;
+
+            setQueue((prev) =>
+              prev.map((q) =>
+                q.id === item.id
+                  ? {
+                      ...q,
+                      downloadedBytes: downloaded,
+                      percentage: item.totalBytes > 0 ? Math.round((downloaded / item.totalBytes) * 100) : 50,
+                      speed,
+                      eta,
+                    }
+                  : q
+              )
+            );
+          }
+        }
+
+        await writable.close();
+      } else {
+        // Fallback for browsers without direct File System API
+        const a = document.createElement("a");
+        a.href = streamUrl;
+        a.setAttribute("download", item.fileName);
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+      }
+
+      setQueue((prev) =>
+        prev.map((q) => (q.id === item.id ? { ...q, percentage: 100, speed: "0 MB/s", eta: "Done", status: "completed" } : q))
+      );
+    } catch (err: any) {
+      if (err.name === "AbortError") {
+        // Paused or Cancelled
+      } else {
+        setQueue((prev) =>
+          prev.map((q) => (q.id === item.id ? { ...q, status: "error", speed: "0 MB/s" } : q))
+        );
+      }
+    } finally {
+      abortControllersRef.current.delete(item.id);
+    }
+  };
+
+  // Triggered manually upon clicking the download button
+  const handleStartDownloads = async () => {
     if (selectedIds.length === 0) {
       setStatusMsg({ text: "Please select at least one file to download.", error: true });
       return;
     }
 
-    isCancelledRef.current = false;
+    await acquireWakeLock();
     const selectedItems = mediaItems.filter((i) => selectedIds.includes(i.id));
 
-    // Initialize local queue
-    const queueInit: LocalDownloadProgress[] = selectedItems.map((item) => ({
+    const initialQueue: QueueItemState[] = selectedItems.map((item) => ({
       id: item.id,
       fileName: item.fileName,
       totalBytes: item.fileSize,
       downloadedBytes: 0,
       percentage: 0,
       speed: "0 MB/s",
+      eta: "--",
       status: "pending",
     }));
-    setLocalQueue(queueInit);
 
-    let dirHandle = localDirectoryHandle;
-    // Ask for folder if not selected yet
-    if (!dirHandle && "showDirectoryPicker" in window) {
-      try {
-        dirHandle = await (window as any).showDirectoryPicker();
-        setLocalDirectoryHandle(dirHandle);
-      } catch {
-        // Fallback to standard browser download
-      }
-    }
+    setQueue(initialQueue);
 
-    for (let i = 0; i < selectedItems.length; i++) {
-      if (isCancelledRef.current) break;
-      const item = selectedItems[i];
-
-      setLocalQueue((prev) =>
-        prev.map((q) => (q.id === item.id ? { ...q, status: "downloading" } : q))
-      );
-
-      try {
-        const streamUrl = `${API_BASE}/api/download/stream?channelId=${encodeURIComponent(String(channelId))}&messageId=${item.id}`;
-
-        if (dirHandle) {
-          // Direct local file writer via Web File System API
-          const fileHandle = await dirHandle.getFileHandle(item.fileName, { create: true });
-          const writable = await fileHandle.createWritable();
-
-          const response = await fetch(streamUrl);
-          if (!response.body) throw new Error("Empty stream body");
-
-          const reader = response.body.getReader();
-          let downloaded = 0;
-          let lastTime = Date.now();
-          let lastBytes = 0;
-
-          while (true) {
-            if (isCancelledRef.current) {
-              await writable.close();
-              break;
-            }
-
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            await writable.write(value);
-            downloaded += value.length;
-
-            const now = Date.now();
-            if (now - lastTime >= 1000) {
-              const diffSec = (now - lastTime) / 1000;
-              const speed = `${((downloaded - lastBytes) / (1024 * 1024 * diffSec)).toFixed(2)} MB/s`;
-              lastBytes = downloaded;
-              lastTime = now;
-
-              setLocalQueue((prev) =>
-                prev.map((q) =>
-                  q.id === item.id
-                    ? {
-                        ...q,
-                        downloadedBytes: downloaded,
-                        percentage: item.fileSize > 0 ? Math.round((downloaded / item.fileSize) * 100) : 50,
-                        speed,
-                      }
-                    : q
-                )
-              );
-            }
-          }
-
-          await writable.close();
-        } else {
-          // Standard browser attachment download fallback
-          const a = document.createElement("a");
-          a.href = streamUrl;
-          a.setAttribute("download", item.fileName);
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-        }
-
-        setLocalQueue((prev) =>
-          prev.map((q) => (q.id === item.id ? { ...q, percentage: 100, speed: "0 MB/s", status: "completed" } : q))
-        );
-      } catch (err: any) {
-        setLocalQueue((prev) =>
-          prev.map((q) => (q.id === item.id ? { ...q, status: "error" } : q))
-        );
-      }
+    for (const item of initialQueue) {
+      await downloadFileStream(item, 0);
     }
   };
 
-  const handleStopDownloads = () => {
-    isCancelledRef.current = true;
-    setLocalQueue((prev) =>
-      prev.map((q) => (q.status === "downloading" ? { ...q, status: "stopped" } : q))
+  // Row-level Action Handlers
+  const handleStopItem = (id: number) => {
+    const controller = abortControllersRef.current.get(id);
+    if (controller) {
+      controller.abort();
+      abortControllersRef.current.delete(id);
+    }
+    setQueue((prev) =>
+      prev.map((q) => (q.id === id ? { ...q, status: "paused", speed: "0 MB/s", eta: "Paused" } : q))
     );
-    setStatusMsg({ text: "Downloads stopped." });
+  };
+
+  const handleResumeItem = (id: number) => {
+    const item = queue.find((q) => q.id === id);
+    if (item) {
+      downloadFileStream(item, item.downloadedBytes);
+    }
+  };
+
+  const handleCancelItem = (id: number) => {
+    const controller = abortControllersRef.current.get(id);
+    if (controller) {
+      controller.abort();
+      abortControllersRef.current.delete(id);
+    }
+    setQueue((prev) => prev.filter((q) => q.id !== id));
   };
 
   const handleClearCompleted = () => {
-    setLocalQueue((prev) => prev.filter((q) => q.status !== "completed"));
+    setQueue((prev) => prev.filter((q) => q.status !== "completed"));
   };
 
   return (
@@ -257,12 +355,12 @@ export default function App(): React.JSX.Element {
             fontSize: "0.8rem",
             padding: "4px 8px",
             borderRadius: 4,
-            backgroundColor: wakeLockActive ? "#dcfce7" : "#f1f5f9",
-            color: wakeLockActive ? "#166534" : "#64748b",
+            backgroundColor: wakeLockActive ? "#dcfce7" : "#fef3c7",
+            color: wakeLockActive ? "#166534" : "#92400e",
             fontWeight: 600,
           }}
         >
-          {wakeLockActive ? "☕ Laptop Awake: ON" : "☕ Keep-Awake: Ready"}
+          {wakeLockActive ? "☕ Laptop Awake: ACTIVE" : "☕ Click anywhere to activate Awake"}
         </span>
       </div>
 
@@ -338,7 +436,7 @@ export default function App(): React.JSX.Element {
 
               <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
                 <button
-                  onClick={handleStartLocalDownload}
+                  onClick={handleStartDownloads}
                   disabled={selectedIds.length === 0}
                   style={{
                     flex: 1,
@@ -353,55 +451,18 @@ export default function App(): React.JSX.Element {
                 >
                   ⬇️ Download {selectedIds.length} Selected Files Directly to PC ({selectedSizeGB} GB)
                 </button>
-
-                {localQueue.some((q) => q.status === "downloading") && (
-                  <button
-                    onClick={handleStopDownloads}
-                    style={{ padding: "12px 20px", background: "#dc2626", color: "#fff", border: "none", borderRadius: 4, cursor: "pointer", fontWeight: 600 }}
-                  >
-                    ⏹ Stop
-                  </button>
-                )}
               </div>
             </>
           )}
 
-          {/* Local Download Queue Progress Display */}
-          {localQueue.length > 0 && (
-            <div style={{ marginTop: 24 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-                <h3 style={{ fontSize: "1.05rem", color: "#0f172a", margin: 0 }}>
-                  Local PC Download Queue ({localQueue.filter((i) => i.status === "completed").length}/{localQueue.length} Completed)
-                </h3>
-                {localQueue.some((i) => i.status === "completed") && (
-                  <button
-                    onClick={handleClearCompleted}
-                    style={{ padding: "4px 10px", fontSize: "0.8rem", background: "#f1f5f9", border: "1px solid #cbd5e1", borderRadius: 4, cursor: "pointer" }}
-                  >
-                    🧹 Clean Completed
-                  </button>
-                )}
-              </div>
-
-              {localQueue.map((item) => (
-                <div key={item.id} style={{ background: "#ffffff", border: "1px solid #e2e8f0", padding: 12, borderRadius: 6, marginBottom: 10 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.85rem", fontWeight: 600 }}>
-                    <span style={{ maxWidth: 400, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.fileName}</span>
-                    <span style={{ color: item.status === "completed" ? "#16a34a" : item.status === "error" ? "#dc2626" : "#0284c7" }}>
-                      {item.status.toUpperCase()}
-                    </span>
-                  </div>
-                  <div style={{ width: "100%", height: 6, background: "#e2e8f0", borderRadius: 3, margin: "8px 0", overflow: "hidden" }}>
-                    <div style={{ width: `${item.percentage}%`, height: "100%", background: item.status === "completed" ? "#16a34a" : "#0284c7" }} />
-                  </div>
-                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.75rem", color: "#64748b" }}>
-                    <span>{item.percentage}% ({item.speed})</span>
-                    <span>{(item.totalBytes / (1024 * 1024)).toFixed(1)} MB</span>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
+          {/* Individual Queue Item Controls: Stop, Resume, Cancel */}
+          <DownloadQueueList
+            queue={queue}
+            onStopItem={handleStopItem}
+            onResumeItem={handleResumeItem}
+            onCancelItem={handleCancelItem}
+            onClearCompleted={handleClearCompleted}
+          />
         </div>
       )}
     </div>
